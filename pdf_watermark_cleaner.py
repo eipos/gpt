@@ -30,13 +30,13 @@ class ScribbleCanvas(tk.Canvas):
         self.scale = 1.0
         self.offset = (0, 0)
 
-    def set_image(self, image_bgr: np.ndarray):
+    def set_image(self, image_bgr: np.ndarray, preserve_mask: bool = False):
         self.image = image_bgr.copy()
         h, w = self.image.shape[:2]
         cw = max(self.winfo_width(), 1)
         ch = max(self.winfo_height(), 1)
         self.scale = min(cw / w, ch / h)
-        rw, rh = int(w * self.scale), int(h * self.scale)
+        rw, rh = max(1, int(w * self.scale)), max(1, int(h * self.scale))
         resized = cv2.resize(self.image, (rw, rh), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -45,7 +45,15 @@ class ScribbleCanvas(tk.Canvas):
         oy = (ch - rh) // 2
         self.offset = (ox, oy)
         self.create_image(ox, oy, image=self.photo, anchor="nw", tags="img")
-        self.mask = np.zeros((h, w), np.uint8)
+        if (not preserve_mask) or self.mask is None or self.mask.shape != (h, w):
+            self.mask = np.zeros((h, w), np.uint8)
+
+        # 重绘已有涂抹轨迹，避免窗口缩放时样本丢失
+        ys, xs = np.where(self.mask > 0)
+        for y, x in zip(ys[::10], xs[::10]):
+            sx = int(x * self.scale) + ox
+            sy = int(y * self.scale) + oy
+            self.create_oval(sx - 2, sy - 2, sx + 2, sy + 2, fill="#00e5ff", outline="")
 
     def screen_to_img(self, x, y):
         if self.image is None:
@@ -191,7 +199,7 @@ class App(tk.Tk):
 
     def _on_resize(self, _evt):
         if self.current_img is not None:
-            self.canvas.set_image(self.current_img)
+            self.canvas.set_image(self.current_img, preserve_mask=True)
 
     def set_status(self, text: str):
         self.status.config(text=text)
@@ -275,11 +283,12 @@ class App(tk.Tk):
 
         diff = np.vectorize(self.angle_diff)(ang, model.angle_deg)
         orient_mask = diff < float(self.angle_tol_var.get())
-        mag_mask = mag > np.percentile(mag, 58)
+        mag_mask = mag > np.percentile(mag, 50)
 
         mask = (color_mask & orient_mask & mag_mask).astype(np.uint8) * 255
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         mask = cv2.dilate(mask, kernel, iterations=1)
         return mask
 
@@ -357,7 +366,19 @@ class App(tk.Tk):
                         (rot > 20).astype(np.uint8) * 255,
                     )
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_all = cv2.morphologyEx(mask_all, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask_all = cv2.morphologyEx(mask_all, cv2.MORPH_CLOSE, kernel, iterations=1)
         return cv2.dilate(mask_all, kernel, iterations=1)
+
+    @staticmethod
+    def _remove_tiny_components(mask: np.ndarray, min_area: int = 80):
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                out[labels == i] = 255
+        return out
 
     def build_combined_mask(self, page, bgr):
         mode = self.mode_var.get()
@@ -382,6 +403,7 @@ class App(tk.Tk):
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=1)
+        combined = self._remove_tiny_components(combined, min_area=90)
         return combined
 
     @staticmethod
@@ -396,7 +418,10 @@ class App(tk.Tk):
     def clean_page(self, page):
         bgr = self._render_page(page, dpi=220)
         mask = self.build_combined_mask(page, bgr)
-        repaired = cv2.inpaint(bgr, mask, int(self.inpaint_var.get()), cv2.INPAINT_TELEA)
+        radius = int(self.inpaint_var.get())
+        repaired_t = cv2.inpaint(bgr, mask, radius, cv2.INPAINT_TELEA)
+        repaired_n = cv2.inpaint(bgr, mask, radius, cv2.INPAINT_NS)
+        repaired = cv2.addWeighted(repaired_t, 0.6, repaired_n, 0.4, 0)
         repaired = self.restore_text_details(bgr, repaired, mask)
         return repaired, mask
 
